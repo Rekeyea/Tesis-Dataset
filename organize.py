@@ -5,8 +5,6 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 from typing import List
-from time import time
-from datetime import timedelta
 import logging
 
 logging.basicConfig(
@@ -26,8 +24,9 @@ class PatientDataOrganizer:
         """
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
+        self.parquet_output_dir = Path(f'{output_dir}/patients')
         self.patient_metadata = None
-        
+
     def read_patient_metadata(self) -> None:
         """Read patient metadata"""
         metadata_path = self.input_dir / 'patient_metadata.csv'
@@ -48,23 +47,39 @@ class PatientDataOrganizer:
 
     def process_measurements(self) -> None:
         """Process measurements into a partitioned parquet dataset"""
-        start_time = time()
-        
         # Ensure output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.parquet_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Read all measurement files
+        measurement_files = self.get_measurement_files()
+        logger.info(f"Reading {len(measurement_files)} measurement files...")
         
-        # Create schema from sample data
-        sample_df = next(pd.read_csv(self.get_measurement_files()[0], chunksize=1))
-        sample_df['patient_id'] = sample_df['device_id'].apply(self.extract_patient_id)
-        sample_df['week_id'] = pd.to_datetime(sample_df['timestamp']).apply(self.get_week_id)
-        sample_df = sample_df.merge(
+        # Read and concatenate all files
+        dfs = []
+        for file in measurement_files:
+            logger.info(f"Reading {file.name}")
+            df = pd.read_csv(file)
+            dfs.append(df)
+        
+        # Combine all data
+        logger.info("Combining all data...")
+        combined_df = pd.concat(dfs, ignore_index=True)
+        logger.info(f"Total rows: {len(combined_df):,}")
+
+        # Process the data
+        logger.info("Processing data...")
+        combined_df['patient_id'] = combined_df['device_id'].apply(self.extract_patient_id)
+        combined_df['week_id'] = pd.to_datetime(combined_df['timestamp']).apply(self.get_week_id)
+        
+        # Merge with metadata
+        logger.info("Merging with patient metadata...")
+        combined_df = combined_df.merge(
             self.patient_metadata,
             on='patient_id',
             how='left'
         )
-        
-        schema = pa.Schema.from_pandas(sample_df)
-        
+
         # Create partitioning
         partitioning = ds.partitioning(
             pa.schema([
@@ -73,139 +88,63 @@ class PatientDataOrganizer:
             ]),
             flavor='hive'
         )
-        
-        # Create dataset
-        dataset = ds.dataset(
-            self.output_dir,
-            schema=schema,
-            partitioning=partitioning
-        )
-        
-        total_rows = 0
-        patient_counts = {}
-        file_sizes = []
-        start_processing = time()
-        last_log = start_processing
-        
-        # Process each measurement file
-        for measurement_file in self.get_measurement_files():
-            logger.info(f"Processing {measurement_file.name}")
-            
-            # Read and process in chunks
-            for chunk_num, chunk in enumerate(pd.read_csv(measurement_file, chunksize=100000)):
-                # Extract patient IDs and merge metadata
-                chunk['patient_id'] = chunk['device_id'].apply(self.extract_patient_id)
-                
-                # Add week partitioning
-                chunk['week_id'] = pd.to_datetime(chunk['timestamp']).apply(self.get_week_id)
-                
-                # Merge metadata
-                chunk = chunk.merge(
-                    self.patient_metadata,
-                    on='patient_id',
-                    how='left'
-                )
-                
-                # Update patient counts
-                counts = chunk['patient_id'].value_counts()
-                for pid, count in counts.items():
-                    patient_counts[pid] = patient_counts.get(pid, 0) + count
-                
-                # Write chunk to dataset
-                table = pa.Table.from_pandas(chunk)
-                write_options = ds.ParquetFileFormat().make_write_options(
-                    compression='snappy',
-                    use_dictionary=True,
-                    write_statistics=True
-                )
 
-                ds.write_dataset(
-                    table,
-                    self.output_dir,
-                    format='parquet',
-                    partitioning=partitioning,
-                    existing_data_behavior='overwrite_or_ignore',
-                    file_options=write_options,
-                    max_rows_per_group=500000,  # Control row group size here
-                    min_rows_per_group=50000    # Minimum rows per group
-                )
-                
-                total_rows += len(chunk)
-                
-                # Log progress every 30 seconds
-                current_time = time()
-                if current_time - last_log >= 30:
-                    rate = total_rows / (current_time - start_processing)
-                    logger.info(
-                        f"Processed {total_rows:,} rows... "
-                        f"Rate: {rate:.2f} rows/second"
-                    )
-                    last_log = current_time
-        
-        end_time = time()
-        elapsed = timedelta(seconds=int(end_time - start_time))
-        
-        # Calculate and log statistics
-        dataset = ds.dataset(self.output_dir, partitioning=partitioning)
-        files = list(dataset.files)
-        
-        # Log dataset statistics
+        # Convert to table
+        logger.info("Converting to Arrow table...")
+        table = pa.Table.from_pandas(combined_df)
+
+        # Write options
+        write_options = ds.ParquetFileFormat().make_write_options(
+            compression='snappy',
+            use_dictionary=True,
+            write_statistics=True
+        )
+
+        # Write dataset
+        logger.info("Writing partitioned dataset...")
+        ds.write_dataset(
+            table,
+            self.parquet_output_dir,
+            format='parquet',
+            partitioning=partitioning,
+            existing_data_behavior='delete_matching',
+            file_options=write_options
+        )
+
+        # Log statistics
         logger.info("\nDataset Statistics:")
-        logger.info(f"Total processing time: {elapsed}")
-        logger.info(f"Total rows processed: {total_rows:,}")
-        logger.info(f"Processing rate: {total_rows / (end_time - start_time):.2f} rows/second")
-        logger.info(f"Number of partition files: {len(files)}")
-        logger.info(f"Number of patients: {len(patient_counts)}")
-        
-        # Log patient statistics
-        patient_stats = pd.Series(patient_counts).describe()
-        logger.info("\nMeasurements per Patient:")
-        logger.info(f"Mean: {patient_stats['mean']:.2f}")
-        logger.info(f"Min: {patient_stats['min']:.0f}")
-        logger.info(f"Max: {patient_stats['max']:.0f}")
+        logger.info(f"Total rows processed: {len(combined_df):,}")
+        logger.info(f"Number of patients: {combined_df['patient_id'].nunique():,}")
+        logger.info(f"Number of weeks: {combined_df['week_id'].nunique():,}")
         
         # Save dataset metadata
         metadata = {
-            'total_rows': total_rows,
-            'num_patients': len(patient_counts),
-            'processing_time': str(elapsed),
+            'total_rows': len(combined_df),
+            'num_patients': combined_df['patient_id'].nunique(),
+            'num_weeks': combined_df['week_id'].nunique(),
             'created_at': pd.Timestamp.now().isoformat(),
             'partitioning': 'patient_id/week_id'
         }
         
         pd.Series(metadata).to_json(self.output_dir / 'dataset_metadata.json')
-        
-        # Create example queries
-        logger.info("\nExample queries:")
-        logger.info("""
-# Read data for a specific patient and week:
-ds.dataset('measurements_dataset').to_table(
-    filter=(ds.field('patient_id') == 'P0001') & 
-          (ds.field('week_id') == '2025-01')
-).to_pandas()
-
-# Read all data for a patient:
-ds.dataset('measurements_dataset').to_table(
-    filter=(ds.field('patient_id') == 'P0001')
-).to_pandas()
-
-# Read all data for a specific week:
-ds.dataset('measurements_dataset').to_table(
-    filter=(ds.field('week_id') == '2025-01')
-).to_pandas()
-""")
 
     def organize_data(self) -> None:
         """Main method to organize all patient data"""
-        logger.info("Reading patient metadata...")
-        self.read_patient_metadata()
+        logger.info("Starting data organization process...")
         
-        logger.info("Processing measurement files...")
-        self.process_measurements()
-        
-        logger.info("Data organization complete!")
+        try:
+            logger.info("Reading patient metadata...")
+            self.read_patient_metadata()
+            
+            logger.info("Processing measurement files...")
+            self.process_measurements()
+            
+            logger.info("Data organization completed successfully!")
+            
+        except Exception as e:
+            logger.error(f"Error during data organization: {e}")
+            raise
 
-# Example usage
 if __name__ == "__main__":
     organizer = PatientDataOrganizer(
         input_dir="patient_dataset",
